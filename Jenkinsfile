@@ -5,7 +5,7 @@ pipeline {
         DOCKER_REGISTRY_CRED_ID = 'docker-hub-credentials'
         DOCKER_USER             = 'your_dockerhub_username'
         EC2_CRED_ID             = 'ec2-ssh-credentials'
-        EC2_HOST                = 'ec2-xx-xx-xx-xx.compute-1.amazonaws.com'
+        EC2_HOST                = '3.110.105.87'
         FRONTEND_IMAGE          = "${DOCKER_USER}/emp-frontend"
         BACKEND_IMAGE           = "${DOCKER_USER}/emp-backend"
         BUILD_TAG               = "${env.BUILD_NUMBER}"

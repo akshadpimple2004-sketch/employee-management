@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # 1. MongoDB Database
+  mongodb:
+    image: mongo:6.0
+    container_name: emp_mongodb
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=db_admin
+      - MONGO_INITDB_ROOT_PASSWORD=secure_admin_pass
+      - MONGO_INITDB_DATABASE=employee_db
+    volumes:
+      - mongo-data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - emp-network
+    restart: always
+
+  # 2. Node.js Backend API
+  backend:
+    image: ${DOCKER_USER:-your_dockerhub_username}/emp-backend:${BUILD_TAG:-latest}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: emp_backend
+    environment:
+      - PORT=8080
+      - MONGO_URI=mongodb://db_admin:secure_admin_pass@mongodb:27017/employee_db?authSource=admin
+    depends_on:
+      - mongodb
+    ports:
+      - "8080:8080"
+    networks:
+      - emp-network
+    restart: always
+
+  # 3. React Frontend (Nginx static hosting inside)
+  frontend:
+    image: ${DOCKER_USER:-your_dockerhub_username}/emp-frontend:${BUILD_TAG:-latest}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: emp_frontend
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    networks:
+      - emp-network
+    restart: always
+
+networks:
+  emp-network:
+    driver: bridge
+
+volumes:
+  mongo-data:

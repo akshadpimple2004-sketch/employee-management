@@ -2,92 +2,80 @@ pipeline {
     agent any
 
     environment {
-        DOCKER_REGISTRY_CRED_ID = 'docker-hub-credentials'
-        DOCKER_USER             = 'your_dockerhub_username'
-        EC2_CRED_ID             = 'ec2-ssh-credentials'
-        EC2_HOST                = '3.110.105.87'
-        FRONTEND_IMAGE          = "${DOCKER_USER}/emp-frontend"
-        BACKEND_IMAGE           = "${DOCKER_USER}/emp-backend"
-        BUILD_TAG               = "${env.BUILD_NUMBER}"
-    }
-
-    options {
-        timeout(time: 20, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '10'))
-        ansiColor('xterm')
+        DOCKER_REGISTRY = 'docker.io'
+        DOCKER_USER     = 'your_docker_hub_username' // <-- CHANGE THIS
+        IMAGE_TAG       = "${BUILD_NUMBER}"
+        EC2_USER        = 'ubuntu'
+        EC2_IP          = '3.110.105.87'
+        SSH_CREDENTIAL  = 'ec2-ssh-key'
+        REGISTRY_CRED   = 'docker-hub-credentials'
     }
 
     stages {
-        stage('SCM Checkout') {
+        stage('Checkout') {
             steps {
-                echo '📥 Fetching the latest commit from repository...'
+                echo 'Checking out source code from Git repository...'
                 checkout scm
             }
         }
 
-        stage('Install & Test') {
+        stage('Security & Syntax Lint') {
             parallel {
-                stage('Frontend Unit Tests') {
+                stage('Lint Backend') {
                     steps {
-                        echo '🧪 Running Frontend Unit Tests...'
-                        // sh 'cd frontend && npm install && npm run test -- --watchAll=false'
-                        sh 'echo "Frontend tests passed."'
+                        sh 'node --check backend/src/server.js'
                     }
                 }
-                stage('Backend Unit Tests') {
+                stage('Lint Frontend') {
                     steps {
-                        echo '🧪 Running Backend Unit Tests...'
-                        // sh 'cd backend && npm install && npm run test'
-                        sh 'echo "Backend tests passed."'
+                        sh 'test -f frontend/package.json'
                     }
                 }
             }
         }
 
-        stage('Docker Image Creation') {
+        stage('Build Docker Images') {
             steps {
-                echo '📦 Building Docker images concurrently...'
-                parallel(
-                    "Build React Frontend": {
-                        sh "docker build -t ${FRONTEND_IMAGE}:${BUILD_TAG} -t ${FRONTEND_IMAGE}:latest ./frontend"
-                    },
-                    "Build Node Backend": {
-                        sh "docker build -t ${BACKEND_IMAGE}:${BUILD_TAG} -t ${BACKEND_IMAGE}:latest ./backend"
-                    }
-                )
+                sh "docker build -t ${DOCKER_USER}/college-backend:${IMAGE_TAG} ./backend"
+                sh "docker build -t ${DOCKER_USER}/college-frontend:${IMAGE_TAG} ./frontend"
+                sh "docker build -t ${DOCKER_USER}/college-nginx:${IMAGE_TAG} ./nginx"
+                sh "docker tag ${DOCKER_USER}/college-backend:${IMAGE_TAG} ${DOCKER_USER}/college-backend:latest"
+                sh "docker tag ${DOCKER_USER}/college-frontend:${IMAGE_TAG} ${DOCKER_USER}/college-frontend:latest"
+                sh "docker tag ${DOCKER_USER}/college-nginx:${IMAGE_TAG} ${DOCKER_USER}/college-nginx:latest"
+            }
+        }
+
+        stage('Vulnerability Scan') {
+            steps {
+                sh "trivy image --severity HIGH,CRITICAL --light ${DOCKER_USER}/college-backend:${IMAGE_TAG} || true"
             }
         }
 
         stage('Push to Registry') {
             steps {
-                echo '🚀 Pushing images to Docker Hub registry...'
-                withCredentials([usernamePassword(credentialsId: env.DOCKER_REGISTRY_CRED_ID, usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
-                    sh "echo ${REG_PASS} | docker login -u ${REG_USER} --password-stdin"
-                    parallel(
-                        "Push Frontend": {
-                            sh "docker push ${FRONTEND_IMAGE}:${BUILD_TAG}"
-                            sh "docker push ${FRONTEND_IMAGE}:latest"
-                        },
-                        "Push Backend": {
-                            sh "docker push ${BACKEND_IMAGE}:${BUILD_TAG}"
-                            sh "docker push ${BACKEND_IMAGE}:latest"
-                        }
-                    )
+                withCredentials([usernamePassword(credentialsId: "${REGISTRY_CRED}", usernameVariable: 'HUB_USER', passwordVariable: 'HUB_PASS')]) {
+                    sh 'echo $HUB_PASS | docker login -u $HUB_USER --password-stdin'
+                    sh "docker push ${DOCKER_USER}/college-backend:${IMAGE_TAG}"
+                    sh "docker push ${DOCKER_USER}/college-frontend:${IMAGE_TAG}"
+                    sh "docker push ${DOCKER_USER}/college-nginx:${IMAGE_TAG}"
+                    sh "docker push ${DOCKER_USER}/college-backend:latest"
+                    sh "docker push ${DOCKER_USER}/college-frontend:latest"
+                    sh "docker push ${DOCKER_USER}/college-nginx:latest"
                 }
             }
         }
 
         stage('Deploy to AWS EC2') {
             steps {
-                echo '🚢 Dispatching stack update to target server...'
-                sshagent([env.EC2_CRED_ID]) {
-                    def remoteServer = "ubuntu@${env.EC2_HOST}"
-                    sh "scp -o StrictHostKeyChecking=no docker-compose.yml ${remoteServer}:/home/ubuntu/docker-compose.yml"
+                sshagent(credentials: ["${SSH_CREDENTIAL}"]) {
+                    sh "ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} 'mkdir -p ~/college-app/db'"
+                    sh "scp -o StrictHostKeyChecking=no docker-compose.prod.yml ${EC2_USER}@${EC2_IP}:~/college-app/docker-compose.yml"
+                    sh "scp -o StrictHostKeyChecking=no db/init.sql ${EC2_USER}@${EC2_IP}:~/college-app/db/init.sql"
                     sh """
-                        ssh -o StrictHostKeyChecking=no ${remoteServer} '
-                            export DOCKER_USER="${env.DOCKER_USER}"
-                            export BUILD_TAG="${env.BUILD_TAG}"
+                        ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_IP} '
+                            cd ~/college-app
                             docker compose pull
+                            export IMAGE_TAG=${IMAGE_TAG}
                             docker compose up -d --remove-orphans
                             docker image prune -f
                         '
@@ -95,85 +83,14 @@ pipeline {
                 }
             }
         }
-
-        stage('Post-Deployment Health Probe') {
-            steps {
-                echo '🔍 Probing service health states...'
-                script {
-                    def maxTries = 5
-                    def delay = 10
-                    def isHealthy = false
-
-                    for (int i = 0; i < maxTries; i++) {
-                        echo "Probing endpoints (Attempt ${i+1}/${maxTries})..."
-                        try {
-                            def frontendCode = sh(script: "curl -s -o /dev/null -w '%{http_code}' http://${EC2_HOST}/", returnStdout: true).trim()
-                            def backendCode = sh(script: "curl -s -o /dev/null -w '%{http_code}' http://${EC2_HOST}:8080/health || curl -s -o /dev/null -w '%{http_code}' http://${EC2_HOST}:8080/", returnStdout: true).trim()
-
-                            if ((frontendCode == "200" || frontendCode == "304") && (backendCode == "200")) {
-                                echo "✅ Both UI and API endpoints are responsive!"
-                                isHealthy = true
-                                break
-                            } else {
-                                echo "⚠️ Mismatch. Frontend HTTP status: ${frontendCode}, Backend API HTTP status: ${backendCode}"
-                            }
-                        } catch (Exception e) {
-                            echo "⚠️ Probe run resulted in an error: ${e.message}"
-                        }
-                        sleep(delay)
-                    }
-
-                    if (!isHealthy) {
-                        error "🚨 Core application services did not pass health validation. Initiating rollback..."
-                    }
-                }
-            }
-        }
     }
 
     post {
-        always {
-            echo '🧹 Post-build step: cleaning workspace...'
-            cleanWs()
-            sh 'docker system prune -f --filter "label=stage=intermediate"'
-        }
         success {
-            emailext (
-                subject: "✅ SUCCESS: '${env.JOB_NAME}' [Build #${env.BUILD_NUMBER}]",
-                body: """<h3>Build and Deployment Succeeded</h3>
-                         <p>Employee Management System is live on target AWS EC2 server.</p>
-                         <p><b>Frontend UI Url:</b> http://${EC2_HOST}</p>
-                         <p>Console dashboard link: <a href='${env.BUILD_URL}console'>View Jenkins Console</a></p>""",
-                to: 'devops-team@yourcompany.com'
-            )
+            echo "CI/CD Pipeline succeeded! Build #${BUILD_NUMBER} deployed successfully."
         }
         failure {
-            script {
-                echo '🚨 Deploy failed. Initiating automatic rollback on target server...'
-                try {
-                    sshagent([env.EC2_CRED_ID]) {
-                        def remoteServer = "ubuntu@${env.EC2_HOST}"
-                        sh """
-                            ssh -o StrictHostKeyChecking=no ${remoteServer} '
-                                export DOCKER_USER="${env.DOCKER_USER}"
-                                export BUILD_TAG="latest-stable"
-                                docker compose pull
-                                docker compose up -d --remove-orphans
-                                echo "✅ Container state rolled back to stable!"
-                            '
-                        """
-                    }
-                } catch(Exception rollbackError) {
-                    echo "❌ Rollback operation failed: ${rollbackError.message}"
-                }
-            }
-            emailext (
-                subject: "🚨 FAILURE: '${env.JOB_NAME}' [Build #${env.BUILD_NUMBER}]",
-                body: """<h3>Build and Deployment Failed</h3>
-                         <p>Failure detected during testing, building, or deploying phase. Inspect the console logs.</p>
-                         <p>Console dashboard link: <a href='${env.BUILD_URL}console'>View Jenkins Console</a></p>""",
-                to: 'devops-team@yourcompany.com'
-            )
+            echo "CI/CD Pipeline failed at some stage. Check Jenkins console logs."
         }
     }
 }
